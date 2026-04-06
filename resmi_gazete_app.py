@@ -12,7 +12,7 @@ from datetime import datetime
 # VERİTABANI FONKSİYONLARI
 # ---------------------------------------------------------------------------
 
-DB_PATH = "resmi_gazete.db"
+DB_PATH = "/tmp/resmi_gazete.db"
 
 def init_db():
     """Veritabanını ve tabloları oluşturur (yoksa)."""
@@ -142,24 +142,52 @@ def pdf_oku(pdf_url: str) -> tuple[str, int]:
         return f"[PDF okunamadı: {e}]", 0
 
 
-def pdf_linklerini_bul(soup: BeautifulSoup) -> list[str]:
+def pdf_linklerini_bul(soup: BeautifulSoup, ham_html: str = "") -> list[str]:
     """
     BeautifulSoup nesnesinden PDF bağlantılarını çıkarır.
-    resmigazete.gov.tr veya .pdf uzantılı her linki döner.
+    4 farklı yöntemle arar:
+      1. <a href> etiketleri
+      2. Tüm etiketlerin tüm attribute'ları (data-url, src, vb.)
+      3. Sayfa metninde düz URL olarak geçen linkler
+      4. Ham HTML üzerinde regex (JavaScript içi, encoded linkler vb.)
     """
-    pdf_linkleri = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
+    bulunanlar = set()
+
+    def ekle(url: str):
+        url = url.strip().rstrip("'\"\\")
         if (
-            href.startswith("http")
+            url.startswith("http")
             and (
-                "resmigazete.gov.tr" in href
-                or href.lower().endswith(".pdf")
+                "resmigazete.gov.tr" in url
+                or url.lower().endswith(".pdf")
             )
         ):
-            if href not in pdf_linkleri:
-                pdf_linkleri.append(href)
-    return pdf_linkleri
+            bulunanlar.add(url)
+
+    # 1) <a href>
+    for a in soup.find_all("a", href=True):
+        ekle(a["href"])
+
+    # 2) Tüm etiketlerin tüm attribute'ları
+    for tag in soup.find_all(True):
+        for attr_val in tag.attrs.values():
+            if isinstance(attr_val, str):
+                ekle(attr_val)
+            elif isinstance(attr_val, list):
+                for v in attr_val:
+                    ekle(v)
+
+    # 3) Sayfa düz metnindeki URL'ler
+    metin = soup.get_text(" ")
+    for url in re.findall(r'https?://\S+', metin):
+        ekle(url)
+
+    # 4) Ham HTML üzerinde regex (JS değişkenleri, data attribute'ları vb.)
+    kaynak = ham_html or str(soup)
+    for url in re.findall(r'https?://[^\s\'"<>]+', kaynak):
+        ekle(url)
+
+    return list(bulunanlar)
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +263,7 @@ with sekme1:
                 with st.expander(f"📅 {tarih} | PDF'leri Tara ve Kaydet"):
                     try:
                         resp = requests.get(haber.link, headers=HEADERS, timeout=15)
+                        ham_html = resp.text
                         soup = BeautifulSoup(resp.content, "html.parser")
 
                         # İçerik metni (linkler korunarak)
@@ -256,11 +285,16 @@ with sekme1:
                             st.info("Haber özeti:")
                             st.write(haber.get("description", ""))
 
-                        # PDF linklerini bul
-                        pdf_linkleri = pdf_linklerini_bul(soup)[:max_pdf]
+                        # PDF linklerini bul (ham HTML dahil 4 yöntemle)
+                        pdf_linkleri = pdf_linklerini_bul(soup, ham_html)[:max_pdf]
 
                         if not pdf_linkleri:
                             st.warning("Bu haberde PDF linki bulunamadı.")
+                            tum_linkler = [a["href"] for a in soup.find_all("a", href=True) if a["href"].startswith("http")]
+                            if tum_linkler:
+                                with st.expander("🔍 Sayfadaki tüm linkler (hata ayıklama)"):
+                                    for lnk in tum_linkler[:30]:
+                                        st.code(lnk)
                         else:
                             st.markdown(f"**📎 {len(pdf_linkleri)} PDF bulundu – işleniyor...**")
                             ilerleme = st.progress(0)
