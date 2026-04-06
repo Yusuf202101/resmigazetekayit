@@ -119,27 +119,108 @@ HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
-    )
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Referer": "https://www.resmigazete.gov.tr/",
 }
+
+def url_getir(url: str, timeout: int = 30) -> requests.Response | None:
+    """
+    Retry + farklı header kombinasyonları ile URL'yi çeker.
+    Başarısız olursa None döner.
+    """
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    session.mount("http://",  HTTPAdapter(max_retries=retry))
+
+    try:
+        resp = session.get(url, headers=HEADERS, timeout=timeout, verify=True)
+        resp.raise_for_status()
+        return resp
+    except Exception:
+        pass
+
+    # SSL doğrulamasını devre dışı bırakarak tekrar dene
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        resp = session.get(url, headers=HEADERS, timeout=timeout, verify=False)
+        resp.raise_for_status()
+        return resp
+    except Exception:
+        return None
+
+
+def htm_icerisindeki_pdf_linklerini_bul(htm_url: str) -> list[str]:
+    """
+    Resmi Gazete .htm sayfasını açar, içindeki .pdf linklerini döner.
+    Örnek: https://www.resmigazete.gov.tr/ilanlar/eskiilanlar/2026/04/20260406-5.htm
+    """
+    resp = url_getir(htm_url)
+    if not resp:
+        return []
+    soup = BeautifulSoup(resp.content, "html.parser")
+    pdf_linkleri = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if href.lower().endswith(".pdf"):
+            # Göreceli URL'yi mutlak yap
+            if href.startswith("http"):
+                pdf_linkleri.append(href)
+            else:
+                from urllib.parse import urljoin
+                pdf_linkleri.append(urljoin(htm_url, href))
+    # Ham HTML'de de ara
+    for url in re.findall(r'https?://[^\s\'"<>]+\.pdf', resp.text):
+        if url not in pdf_linkleri:
+            pdf_linkleri.append(url)
+    return pdf_linkleri
+
 
 def pdf_oku(pdf_url: str) -> tuple[str, int]:
     """
-    Verilen URL'den PDF indirir, pdfplumber ile metin çıkarır.
-    (metin, sayfa_sayisi) döner. Hata durumunda ("", 0) döner.
+    Verilen URL'den PDF veya HTM indirir, pdfplumber ile metin çıkarır.
+    .htm uzantılıysa önce içindeki PDF linkini bulur.
+    (metin, sayfa_sayisi) döner. Hata durumunda (hata_mesaji, 0) döner.
     """
-    try:
-        resp = requests.get(pdf_url, headers=HEADERS, timeout=30)
-        resp.raise_for_status()
-        with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
-            sayfa_sayisi = len(pdf.pages)
-            metinler = []
-            for sayfa in pdf.pages:
-                metin = sayfa.extract_text()
-                if metin:
-                    metinler.append(metin)
-            return "\n\n".join(metinler), sayfa_sayisi
-    except Exception as e:
-        return f"[PDF okunamadı: {e}]", 0
+    # .htm ise önce PDF linkini çöz
+    gercek_pdf_urller = []
+    if pdf_url.lower().endswith(".htm") or pdf_url.lower().endswith(".html"):
+        gercek_pdf_urller = htm_icerisindeki_pdf_linklerini_bul(pdf_url)
+        if not gercek_pdf_urller:
+            return f"[HTM sayfasında PDF bulunamadı: {pdf_url}]", 0
+    else:
+        gercek_pdf_urller = [pdf_url]
+
+    tum_metinler = []
+    toplam_sayfa = 0
+    for gurl in gercek_pdf_urller:
+        resp = url_getir(gurl)
+        if not resp:
+            tum_metinler.append(f"[İndirilemedi: {gurl}]")
+            continue
+        try:
+            with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
+                toplam_sayfa += len(pdf.pages)
+                for sayfa in pdf.pages:
+                    metin = sayfa.extract_text()
+                    if metin:
+                        tum_metinler.append(metin)
+        except Exception as e:
+            tum_metinler.append(f"[PDF parse hatası: {e}]")
+
+    return "\n\n".join(tum_metinler), toplam_sayfa
 
 
 def pdf_linklerini_bul(soup: BeautifulSoup, ham_html: str = "") -> list[str]:
@@ -155,13 +236,13 @@ def pdf_linklerini_bul(soup: BeautifulSoup, ham_html: str = "") -> list[str]:
 
     def ekle(url: str):
         url = url.strip().rstrip("'\"\\")
-        if (
-            url.startswith("http")
-            and (
-                "resmigazete.gov.tr" in url
-                or url.lower().endswith(".pdf")
-            )
-        ):
+        if not url.startswith("http"):
+            return
+        u = url.lower()
+        # resmigazete.gov.tr altındaki .pdf, .htm, .html linkleri al
+        if "resmigazete.gov.tr" in u:
+            bulunanlar.add(url)
+        elif u.endswith(".pdf"):
             bulunanlar.add(url)
 
     # 1) <a href>
