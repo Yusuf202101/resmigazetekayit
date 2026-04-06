@@ -1,5 +1,0 @@
-streamlit
-feedparser
-requests
-PyPDF2
-pandas
